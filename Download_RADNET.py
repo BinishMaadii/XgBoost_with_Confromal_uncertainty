@@ -1,14 +1,6 @@
 """
-Run this LOCALLY (needs normal internet access) to pull the full RadNet
-archive for one or more stations, concatenated into a single CSV ready
-for pipeline.py.
-
 Usage:
     python download_radnet.py
-
-Edit STATIONS below to add more cities -- more stations = more diversity
-in background radiation levels, which is a better story for the portfolio
-piece than a single station anyway.
 """
 import pandas as pd
 import time
