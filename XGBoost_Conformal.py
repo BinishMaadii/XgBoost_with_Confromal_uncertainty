@@ -17,15 +17,83 @@ from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, r2_score
 
-FEATURES = ["R02", "R03", "R04", "R05", "R06", "R07", "R08", "R09"]
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+
+
+
+BASE_FEATURES = ["R02", "R03", "R04", "R05", "R06", "R07", "R08", "R09"]
 TARGET = "DOSE_RATE"
 
-
+""""
 def load_radnet_csv(path):
     df = pd.read_csv(path)
     df = df.dropna(subset=FEATURES + [TARGET])
     return df
 
+
+def load_radnet_csv(path, sample_size=None, random_state=42):
+    df = pd.read_csv(path)
+    station_dummies = pd.get_dummies(df["LOCATION_NAME"], prefix="station")
+    df = pd.concat([df, station_dummies], axis=1)
+    FEATURES = FEATURES + list(station_dummies.columns)  # updating global FEATURES accordingly
+    df = df.dropna(subset=FEATURES + [TARGET])
+    if sample_size is not None:
+        df = df.sample(n=min(sample_size, len(df)), random_state=random_state)
+    return df
+
+
+def load_radnet_csv(path, sample_size=None, random_state=42):
+    df = pd.read_csv(path)
+    station_dummies = pd.get_dummies(df["LOCATION_NAME"], prefix="station")
+    print(df["LOCATION_NAME"].value_counts())
+    df = pd.concat([df, station_dummies], axis=1)
+    features = BASE_FEATURES + list(station_dummies.columns)
+    df = df.dropna(subset=features + [TARGET])
+    if sample_size is not None:
+        df = df.sample(n=min(sample_size, len(df)), random_state=random_state)
+    return df, features
+"""
+
+def load_radnet_csv(path, sample_size=None, random_state=42):
+    df = pd.read_csv(path)
+    station_dummies = pd.get_dummies(df["LOCATION_NAME"], prefix="station")
+    df = pd.concat([df, station_dummies], axis=1)
+
+    # log-transformed counts (compresses the spikes)
+    log_features = []
+    for col in BASE_FEATURES:
+        log_col = f"log_{col}"
+        df[log_col] = np.log1p(df[col])
+        log_features.append(log_col)
+
+    # channel ratios (cancel out overall intensity, keep spectral shape --
+    # this is closer to what real isotope-ID/dose algorithms use)
+    ratio_features = []
+    pairs = [("R02", "R08"), ("R02", "R09"), ("R03", "R07"), ("R05", "R09")]
+    for num, denom in pairs:
+        ratio_col = f"ratio_{num}_{denom}"
+        df[ratio_col] = df[num] / df[denom].replace(0, np.nan)
+        ratio_features.append(ratio_col)
+
+    features = (
+        BASE_FEATURES
+        + list(station_dummies.columns)
+        + log_features
+        + ratio_features
+    )
+    print(df["ratio_R02_R09"].sort_values(ascending=False).head(10))
+    df = df.dropna(subset=features + [TARGET])
+    print(df.loc[[121617, 121616, 121672, 121632, 121606], ["LOCATION_NAME", "SAMPLE_TIME", "R02", "R09", "DOSE_RATE"]])
+    if sample_size is not None:
+        df = df.sample(n=min(sample_size, len(df)), random_state=random_state)
+    return df, features
+
+
+
+
+#df = df[(df["DOSE_RATE"] > 0) & (df[FEATURES] > 0).all(axis=1)]
 
 def baseline_regression(df):
     X = df[FEATURES].values
@@ -34,6 +102,7 @@ def baseline_regression(df):
         X, y, test_size=0.25, random_state=42
     )
     rf = RandomForestRegressor(n_estimators=300, max_depth=6, random_state=42)
+    #rf = RandomForestRegressor(n_estimators=300, max_depth=6, random_state=42)
     rf.fit(X_train, y_train)
     pred = rf.predict(X_test)
     print(f"[Baseline RF] MAE = {mean_absolute_error(y_test, pred):.2f} nSv/h, "
@@ -41,7 +110,8 @@ def baseline_regression(df):
     return rf, X_train, X_test, y_train, y_test
 
 
-def deep_ensemble(X_train, y_train, X_test, y_test, n_models=8):
+#def deep_ensemble(X_train, y_train, X_test, y_test, n_models=8):
+def deep_ensemble(X_train, y_train, X_test, y_test, n_models=15):
     """Train n_models MLPs with different seeds/bootstraps; use spread as UQ."""
     scaler = StandardScaler().fit(X_train)
     Xtr = scaler.transform(X_train)
@@ -86,7 +156,20 @@ def split_conformal(mean_pred_cal, y_cal, mean_pred_test, alpha=0.1):
 
 
 if __name__ == "__main__":
-    df = load_radnet_csv("/Users/binishbatool/PycharmProjects/pythonProject/radnet_full.csv")
+    #df = load_radnet_csv("/Users/binishbatool/PycharmProjects/pythonProject/radnet_full.csv")
+    df, FEATURES = load_radnet_csv("radnet_full.csv", sample_size=None)
+    corr = df[["DOSE_RATE"] + BASE_FEATURES].corr()
+
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm", vmin=-1, vmax=1,
+                square=True, cbar_kws={"label": "Pearson correlation"})
+    plt.title(f"DOSE_RATE vs gamma channels (n={len(df)})")
+    plt.tight_layout()
+    plt.savefig("correlation_heatmap.png", dpi=150)
+    #plt.show()
+
+    df = df[(df["DOSE_RATE"] > 0) & (df[BASE_FEATURES] > 0).all(axis=1)]
+
     print(f"Loaded {len(df)} hourly readings from Philadelphia RadNet station")
     print(df[[TARGET] + FEATURES].describe().round(1))
     print()
