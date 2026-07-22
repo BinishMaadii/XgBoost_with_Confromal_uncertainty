@@ -1,0 +1,530 @@
+
+import io
+import os
+import zipfile
+import urllib.request
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, roc_curve, average_precision_score
+import xgboost as xgb
+import shap
+
+RNG_SEED = 42
+np.random.seed(RNG_SEED)
+
+
+
+DR2_DATA_DIR = "icetracks_dr2/events"   # <- point this at your unzipped Dataverse download
+DR2_DOI_URL = "https://doi.org/10.7910/DVN/MMIIZA"
+
+
+def load_local_dr2(data_dir: str) -> pd.DataFrame:
+    files = [f for f in os.listdir(data_dir) if f.lower().endswith((".csv", ".txt"))]
+    if not files:
+        raise FileNotFoundError(f"No event files found in {data_dir}")
+    frames = []
+    for fn in sorted(files):
+        df = pd.read_csv(os.path.join(data_dir, fn), sep=None, engine="python")
+        df.columns = [c.strip() for c in df.columns]
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True)
+
+
+def make_synthetic_icecube(n_events: int = 200_000, seed: int = RNG_SEED) -> pd.DataFrame:
+    '''
+    Schema-matched synthetic stand-in for IceTracks-DR2, used only if no local
+    data release is found. Encodes two well-known real effects so the
+    classification task isn't trivial-by-construction:
+      - atmospheric background dominates the Northern sky (Earth shields
+        atmospheric muons; neutrinos pass through) and falls off steeply
+        with energy (~E^-3.7)
+      - the harder astrophysical-like population is flatter in declination
+        and has a harder spectrum (~E^-2.0 to -2.5)
+    '''
+    rng = np.random.default_rng(seed)
+    dec = np.degrees(np.arcsin(rng.uniform(-1, 1, n_events)))  # isotropic on the sky
+    ra = rng.uniform(0, 360, n_events)
+    zenith = 90 - dec
+    azimuth = rng.uniform(0, 360, n_events)
+
+    def powerlaw_sample(n, gamma, e_min, e_max=1e8):
+        u = rng.random(n)
+        a, b = e_min ** (1 - gamma), e_max ** (1 - gamma)
+        return (a + u * (b - a)) ** (1 / (1 - gamma))
+
+    # true (hidden) latent population -- only used to build a realistic energy
+    # spectrum; the classifier never sees this, it only sees the reweighted
+    # pseudo-labels built downstream from log10(E/GeV) and declination
+    frac_astro = 0.02
+    is_astro_latent = rng.random(n_events) < frac_astro
+    e_conv = powerlaw_sample(n_events, gamma=3.0, e_min=100)      # steep, soft
+    e_astro = powerlaw_sample(n_events, gamma=2.2, e_min=800)     # hard, rare
+    e_gev = np.where(is_astro_latent, e_astro, e_conv)
+
+    # atmospheric component is suppressed in the Southern sky (higher energy
+    # threshold from the down-going muon veto); astrophysical is isotropic
+    dec_suppression = np.where(is_astro_latent, 1.0, np.clip(1.3 - dec / 250, 0.35, None))
+    e_gev = e_gev * dec_suppression
+    log10E = np.log10(np.clip(e_gev, 100, 1e8))
+
+    ang_err = np.clip(rng.gamma(2.0, 0.35 / (1 + 0.15 * (log10E - 3))), 0.05, 5.0)
+    mjd = rng.uniform(54000, 59900, n_events)
+
+    return pd.DataFrame({
+        "MJD[days]": mjd,
+        "log10(E/GeV)": log10E,
+        "AngErr[deg]": ang_err,
+        "RA[deg]": ra,
+        "Dec[deg]": dec,
+        "Azimuth[deg]": azimuth,
+        "Zenith[deg]": zenith,
+    })
+
+
+try:
+    events = load_local_dr2(DR2_DATA_DIR)
+    print(f"Loaded real IceTracks-DR2 data: {len(events)} events from {DR2_DATA_DIR}")
+except Exception as exc:
+    print(f"[info] No local IceTracks-DR2 files found ({exc}).")
+    print(f"       Download the real release from: {DR2_DOI_URL}")
+    print(f"       unzip it into '{DR2_DATA_DIR}', then re-run this cell.")
+    print("       Using synthetic schema-matched data for now.")
+    events = make_synthetic_icecube()
+
+events.head()
+
+
+
+
+def spectral_weights(log10E: np.ndarray, gamma: float, proposal_gamma: float = 3.0) -> np.ndarray:
+    '''
+    Importance weight to re-target a population already following
+    dN/dE ~ E^-proposal_gamma (roughly true of the real detected event rate)
+    towards dN/dE ~ E^-gamma. Only the *relative* slope (gamma - proposal_gamma)
+    matters -- weighting by the raw target exponent alone over-concentrates
+    on a handful of extreme-energy events and destroys the resampled shape.
+    '''
+    delta = gamma - proposal_gamma
+    return 10 ** (-delta * log10E)
+
+
+gamma_conv, gamma_astro = 3.7, 2.3
+w_bkg = spectral_weights(events["log10(E/GeV)"].values, gamma_conv)
+w_sig = spectral_weights(events["log10(E/GeV)"].values, gamma_astro)
+
+n_per_class = min(80_000, len(events) // 3)
+rng = np.random.default_rng(RNG_SEED)
+
+bkg_idx = rng.choice(len(events), size=n_per_class, replace=True, p=w_bkg / w_bkg.sum())
+sig_idx = rng.choice(len(events), size=n_per_class, replace=True, p=w_sig / w_sig.sum())
+
+df_bkg = events.iloc[bkg_idx].copy(); df_bkg["label"] = 0
+df_sig = events.iloc[sig_idx].copy(); df_sig["label"] = 1
+dataset = pd.concat([df_bkg, df_sig], ignore_index=True).sample(frac=1.0, random_state=RNG_SEED)
+
+print(dataset["label"].value_counts())
+dataset.head()
+
+
+
+
+
+
+feature_cols = ["log10(E/GeV)", "AngErr[deg]", "Dec[deg]", "Zenith[deg]"]
+
+# a couple of simple derived features
+dataset["sin_dec"] = np.sin(np.radians(dataset["Dec[deg]"]))
+dataset["log_ang_err"] = np.log10(dataset["AngErr[deg]"].clip(lower=1e-3))
+feature_cols += ["sin_dec", "log_ang_err"]
+
+X = dataset[feature_cols].values
+y = dataset["label"].values
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.25, stratify=y, random_state=RNG_SEED
+)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_train, y_train, test_size=0.2, stratify=y_train, random_state=RNG_SEED
+)
+
+scaler = StandardScaler().fit(X_train)
+X_train_s, X_val_s, X_test_s = (scaler.transform(a) for a in (X_train, X_val, X_test))
+
+print(f"train={len(X_train)}  val={len(X_val)}  test={len(X_test)}  features={feature_cols}")
+
+
+
+
+clf = xgb.XGBClassifier(
+    n_estimators=400,
+    max_depth=5,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    eval_metric="auc",
+    early_stopping_rounds=30,
+    random_state=RNG_SEED,
+    n_jobs=-1,
+)
+clf.fit(X_train_s, y_train, eval_set=[(X_val_s, y_val)], verbose=False)
+
+baseline = LogisticRegression(max_iter=2000)
+baseline.fit(X_train_s, y_train)
+
+print("Training complete.")
+
+
+
+
+y_score = clf.predict_proba(X_test_s)[:, 1]
+y_score_base = baseline.predict_proba(X_test_s)[:, 1]
+
+auc = roc_auc_score(y_test, y_score)
+pr_auc = average_precision_score(y_test, y_score)
+auc_base = roc_auc_score(y_test, y_score_base)
+
+print(f"XGBoost   ROC-AUC = {auc:.4f}   PR-AUC = {pr_auc:.4f}")
+print(f"Logistic  ROC-AUC = {auc_base:.4f}  (baseline)")
+
+fpr, tpr, _ = roc_curve(y_test, y_score)
+fpr_b, tpr_b, _ = roc_curve(y_test, y_score_base)
+
+plt.close("all")  # defensive: avoid drawing on top of a figure left open by a re-run cell
+plt.figure(figsize=(5.5, 5))
+plt.plot(fpr, tpr, label=f"XGBoost (AUC={auc:.3f})")
+plt.plot(fpr_b, tpr_b, "--", label=f"Logistic (AUC={auc_base:.3f})")
+plt.plot([0, 1], [0, 1], ":", color="grey")
+plt.xlabel("False positive rate (atmospheric acceptance)")
+plt.ylabel("True positive rate (astrophysical-like efficiency)")
+plt.title("ROC: signal-weighted vs. background-weighted classes")
+plt.legend()
+plt.tight_layout()
+plt.show()
+#plt.close("all")
+
+
+
+# recompute spectral weights for exactly the held-out test rows
+test_mask = np.zeros(len(dataset), dtype=bool)
+_, test_pos = train_test_split(np.arange(len(dataset)), test_size=0.25, stratify=y, random_state=RNG_SEED)
+test_mask[test_pos] = True
+w_test_bkg_raw = spectral_weights(dataset["log10(E/GeV)"].values[test_mask], gamma_conv)
+w_test_sig_raw = spectral_weights(dataset["log10(E/GeV)"].values[test_mask], gamma_astro)
+
+# normalize each to its own sum, then scale to an assumed physical population
+# size so S and B are on a directly comparable, physically meaningful footing
+N_BKG_ASSUMED = 200_000   # illustrative -- replace with your real exposure-based estimate
+N_SIG_ASSUMED = 100       # illustrative -- background-dominated, as in real IceCube PS data
+w_test_bkg = (w_test_bkg_raw / w_test_bkg_raw.sum()) * N_BKG_ASSUMED
+w_test_sig = (w_test_sig_raw / w_test_sig_raw.sum()) * N_SIG_ASSUMED
+w_physical = np.where(y_test == 1, w_test_sig, w_test_bkg)
+
+thresholds = np.linspace(0, 1, 200)
+significance = []
+for thr in thresholds:
+    sel = y_score >= thr
+    S = w_physical[sel & (y_test == 1)].sum()
+    B = w_physical[sel & (y_test == 0)].sum()
+    significance.append(S / np.sqrt(S + B) if (S + B) > 0 else 0.0)
+
+significance = np.array(significance)
+best_thr = thresholds[np.argmax(significance)]
+
+plt.close("all")
+plt.figure(figsize=(5.5, 4.5))
+plt.plot(thresholds, significance)
+plt.axvline(best_thr, color="red", ls="--", label=f"best thr={best_thr:.2f}")
+plt.xlabel("Classifier score threshold")
+plt.ylabel(r"$S/\sqrt{S+B}$")
+plt.title("Significance vs. score cut")
+plt.legend()
+plt.tight_layout()
+plt.show()
+#plt.close("all")
+
+print(f"Best threshold: {best_thr:.3f}  (S/sqrt(S+B) = {significance.max():.3f})")
+
+
+
+
+explainer = shap.TreeExplainer(clf)
+sample_idx = rng.choice(len(X_test_s), size=min(3000, len(X_test_s)), replace=False)
+shap_values = explainer.shap_values(X_test_s[sample_idx])
+
+plt.close("all")  # SHAP draws onto the "current" axes -- make sure that's a clean one
+plt.figure()
+shap.summary_plot(shap_values, X_test_s[sample_idx], feature_names=feature_cols, max_display=10, show=False)
+plt.tight_layout()
+plt.show()
+plt.close("all")
+
+import io
+import os
+import zipfile
+import urllib.request
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, roc_curve, average_precision_score
+import xgboost as xgb
+import shap
+
+RNG_SEED = 42
+np.random.seed(RNG_SEED)
+
+
+
+DR2_DATA_DIR = "icetracks_dr2/events"   # <- point this at your unzipped Dataverse download
+DR2_DOI_URL = "https://doi.org/10.7910/DVN/MMIIZA"
+
+
+def load_local_dr2(data_dir: str) -> pd.DataFrame:
+    files = [f for f in os.listdir(data_dir) if f.lower().endswith((".csv", ".txt"))]
+    if not files:
+        raise FileNotFoundError(f"No event files found in {data_dir}")
+    frames = []
+    for fn in sorted(files):
+        df = pd.read_csv(os.path.join(data_dir, fn), sep=None, engine="python")
+        df.columns = [c.strip() for c in df.columns]
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True)
+
+
+def make_synthetic_icecube(n_events: int = 200_000, seed: int = RNG_SEED) -> pd.DataFrame:
+    '''
+    Schema-matched synthetic stand-in for IceTracks-DR2, used only if no local
+    data release is found. Encodes two well-known real effects so the
+    classification task isn't trivial-by-construction:
+      - atmospheric background dominates the Northern sky (Earth shields
+        atmospheric muons; neutrinos pass through) and falls off steeply
+        with energy (~E^-3.7)
+      - the harder astrophysical-like population is flatter in declination
+        and has a harder spectrum (~E^-2.0 to -2.5)
+    '''
+    rng = np.random.default_rng(seed)
+    dec = np.degrees(np.arcsin(rng.uniform(-1, 1, n_events)))  # isotropic on the sky
+    ra = rng.uniform(0, 360, n_events)
+    zenith = 90 - dec
+    azimuth = rng.uniform(0, 360, n_events)
+
+    def powerlaw_sample(n, gamma, e_min, e_max=1e8):
+        u = rng.random(n)
+        a, b = e_min ** (1 - gamma), e_max ** (1 - gamma)
+        return (a + u * (b - a)) ** (1 / (1 - gamma))
+
+    # true (hidden) latent population -- only used to build a realistic energy
+    # spectrum; the classifier never sees this, it only sees the reweighted
+    # pseudo-labels built downstream from log10(E/GeV) and declination
+    frac_astro = 0.02
+    is_astro_latent = rng.random(n_events) < frac_astro
+    e_conv = powerlaw_sample(n_events, gamma=3.0, e_min=100)      # steep, soft
+    e_astro = powerlaw_sample(n_events, gamma=2.2, e_min=800)     # hard, rare
+    e_gev = np.where(is_astro_latent, e_astro, e_conv)
+
+    # atmospheric component is suppressed in the Southern sky (higher energy
+    # threshold from the down-going muon veto); astrophysical is isotropic
+    dec_suppression = np.where(is_astro_latent, 1.0, np.clip(1.3 - dec / 250, 0.35, None))
+    e_gev = e_gev * dec_suppression
+    log10E = np.log10(np.clip(e_gev, 100, 1e8))
+
+    ang_err = np.clip(rng.gamma(2.0, 0.35 / (1 + 0.15 * (log10E - 3))), 0.05, 5.0)
+    mjd = rng.uniform(54000, 59900, n_events)
+
+    return pd.DataFrame({
+        "MJD[days]": mjd,
+        "log10(E/GeV)": log10E,
+        "AngErr[deg]": ang_err,
+        "RA[deg]": ra,
+        "Dec[deg]": dec,
+        "Azimuth[deg]": azimuth,
+        "Zenith[deg]": zenith,
+    })
+
+
+try:
+    events = load_local_dr2(DR2_DATA_DIR)
+    print(f"Loaded real IceTracks-DR2 data: {len(events)} events from {DR2_DATA_DIR}")
+except Exception as exc:
+    print(f"[info] No local IceTracks-DR2 files found ({exc}).")
+    print(f"       Download the real release from: {DR2_DOI_URL}")
+    print(f"       unzip it into '{DR2_DATA_DIR}', then re-run this cell.")
+    print("       Using synthetic schema-matched data for now.")
+    events = make_synthetic_icecube()
+
+events.head()
+
+
+
+
+def spectral_weights(log10E: np.ndarray, gamma: float, proposal_gamma: float = 3.0) -> np.ndarray:
+    '''
+    Importance weight to re-target a population already following
+    dN/dE ~ E^-proposal_gamma (roughly true of the real detected event rate)
+    towards dN/dE ~ E^-gamma. Only the *relative* slope (gamma - proposal_gamma)
+    matters -- weighting by the raw target exponent alone over-concentrates
+    on a handful of extreme-energy events and destroys the resampled shape.
+    '''
+    delta = gamma - proposal_gamma
+    return 10 ** (-delta * log10E)
+
+
+gamma_conv, gamma_astro = 3.7, 2.3
+w_bkg = spectral_weights(events["log10(E/GeV)"].values, gamma_conv)
+w_sig = spectral_weights(events["log10(E/GeV)"].values, gamma_astro)
+
+n_per_class = min(80_000, len(events) // 3)
+rng = np.random.default_rng(RNG_SEED)
+
+bkg_idx = rng.choice(len(events), size=n_per_class, replace=True, p=w_bkg / w_bkg.sum())
+sig_idx = rng.choice(len(events), size=n_per_class, replace=True, p=w_sig / w_sig.sum())
+
+df_bkg = events.iloc[bkg_idx].copy(); df_bkg["label"] = 0
+df_sig = events.iloc[sig_idx].copy(); df_sig["label"] = 1
+dataset = pd.concat([df_bkg, df_sig], ignore_index=True).sample(frac=1.0, random_state=RNG_SEED)
+
+print(dataset["label"].value_counts())
+dataset.head()
+
+
+
+
+
+
+feature_cols = ["log10(E/GeV)", "AngErr[deg]", "Dec[deg]", "Zenith[deg]"]
+
+# a couple of simple derived features
+dataset["sin_dec"] = np.sin(np.radians(dataset["Dec[deg]"]))
+dataset["log_ang_err"] = np.log10(dataset["AngErr[deg]"].clip(lower=1e-3))
+feature_cols += ["sin_dec", "log_ang_err"]
+
+X = dataset[feature_cols].values
+y = dataset["label"].values
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.25, stratify=y, random_state=RNG_SEED
+)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_train, y_train, test_size=0.2, stratify=y_train, random_state=RNG_SEED
+)
+
+scaler = StandardScaler().fit(X_train)
+X_train_s, X_val_s, X_test_s = (scaler.transform(a) for a in (X_train, X_val, X_test))
+
+print(f"train={len(X_train)}  val={len(X_val)}  test={len(X_test)}  features={feature_cols}")
+
+
+
+
+clf = xgb.XGBClassifier(
+    n_estimators=400,
+    max_depth=5,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    eval_metric="auc",
+    early_stopping_rounds=30,
+    random_state=RNG_SEED,
+    n_jobs=-1,
+)
+clf.fit(X_train_s, y_train, eval_set=[(X_val_s, y_val)], verbose=False)
+
+baseline = LogisticRegression(max_iter=2000)
+baseline.fit(X_train_s, y_train)
+
+print("Training complete.")
+
+
+
+
+y_score = clf.predict_proba(X_test_s)[:, 1]
+y_score_base = baseline.predict_proba(X_test_s)[:, 1]
+
+auc = roc_auc_score(y_test, y_score)
+pr_auc = average_precision_score(y_test, y_score)
+auc_base = roc_auc_score(y_test, y_score_base)
+
+print(f"XGBoost   ROC-AUC = {auc:.4f}   PR-AUC = {pr_auc:.4f}")
+print(f"Logistic  ROC-AUC = {auc_base:.4f}  (baseline)")
+
+fpr, tpr, _ = roc_curve(y_test, y_score)
+fpr_b, tpr_b, _ = roc_curve(y_test, y_score_base)
+
+plt.close("all")  # defensive: avoid drawing on top of a figure left open by a re-run cell
+plt.figure(figsize=(5.5, 5))
+plt.plot(fpr, tpr, label=f"XGBoost (AUC={auc:.3f})")
+plt.plot(fpr_b, tpr_b, "--", label=f"Logistic (AUC={auc_base:.3f})")
+plt.plot([0, 1], [0, 1], ":", color="grey")
+plt.xlabel("False positive rate (atmospheric acceptance)")
+plt.ylabel("True positive rate (astrophysical-like efficiency)")
+plt.title("ROC: signal-weighted vs. background-weighted classes")
+plt.legend()
+plt.tight_layout()
+plt.show()
+#plt.close("all")
+
+
+
+# recompute spectral weights for exactly the held-out test rows
+test_mask = np.zeros(len(dataset), dtype=bool)
+_, test_pos = train_test_split(np.arange(len(dataset)), test_size=0.25, stratify=y, random_state=RNG_SEED)
+test_mask[test_pos] = True
+w_test_bkg_raw = spectral_weights(dataset["log10(E/GeV)"].values[test_mask], gamma_conv)
+w_test_sig_raw = spectral_weights(dataset["log10(E/GeV)"].values[test_mask], gamma_astro)
+
+# normalize each to its own sum, then scale to an assumed physical population
+# size so S and B are on a directly comparable, physically meaningful footing
+N_BKG_ASSUMED = 200_000   # illustrative -- replace with your real exposure-based estimate
+N_SIG_ASSUMED = 100       # illustrative -- background-dominated, as in real IceCube PS data
+w_test_bkg = (w_test_bkg_raw / w_test_bkg_raw.sum()) * N_BKG_ASSUMED
+w_test_sig = (w_test_sig_raw / w_test_sig_raw.sum()) * N_SIG_ASSUMED
+w_physical = np.where(y_test == 1, w_test_sig, w_test_bkg)
+
+thresholds = np.linspace(0, 1, 200)
+significance = []
+for thr in thresholds:
+    sel = y_score >= thr
+    S = w_physical[sel & (y_test == 1)].sum()
+    B = w_physical[sel & (y_test == 0)].sum()
+    significance.append(S / np.sqrt(S + B) if (S + B) > 0 else 0.0)
+
+significance = np.array(significance)
+best_thr = thresholds[np.argmax(significance)]
+
+plt.close("all")
+plt.figure(figsize=(5.5, 4.5))
+plt.plot(thresholds, significance)
+plt.axvline(best_thr, color="red", ls="--", label=f"best thr={best_thr:.2f}")
+plt.xlabel("Classifier score threshold")
+plt.ylabel(r"$S/\sqrt{S+B}$")
+plt.title("Significance vs. score cut")
+plt.legend()
+plt.tight_layout()
+plt.show()
+#plt.close("all")
+
+print(f"Best threshold: {best_thr:.3f}  (S/sqrt(S+B) = {significance.max():.3f})")
+
+
+
+
+explainer = shap.TreeExplainer(clf)
+sample_idx = rng.choice(len(X_test_s), size=min(3000, len(X_test_s)), replace=False)
+shap_values = explainer.shap_values(X_test_s[sample_idx])
+
+plt.close("all")  # SHAP draws onto the "current" axes -- make sure that's a clean one
+plt.figure()
+shap.summary_plot(shap_values, X_test_s[sample_idx], feature_names=feature_cols, max_display=10, show=False)
+plt.tight_layout()
+plt.show()
+plt.close("all")
