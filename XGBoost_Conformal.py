@@ -20,7 +20,8 @@ from sklearn.metrics import mean_absolute_error, r2_score
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-
+# raw gamma channel columns from the RadNet export, and the column we're
+# trying to predict
 
 
 BASE_FEATURES = ["R02", "R03", "R04", "R05", "R06", "R07", "R08", "R09"]
@@ -58,6 +59,11 @@ def load_radnet_csv(path, sample_size=None, random_state=42):
 
 def load_radnet_csv(path, sample_size=None, random_state=42):
     df = pd.read_csv(path)
+
+    # LOCATION_NAME covers more than one station, so one-hot encode it --
+    # otherwise the model has no way to tell "this station reads high" apart
+    # from "the dose rate is actually high"
+         
     station_dummies = pd.get_dummies(df["LOCATION_NAME"], prefix="station")
     df = pd.concat([df, station_dummies], axis=1)
 
@@ -83,8 +89,14 @@ def load_radnet_csv(path, sample_size=None, random_state=42):
         + log_features
         + ratio_features
     )
+    # quick look at the most extreme ratio_R02_R09 rows before dropping
+    # anything -- worth eyeballing since a ratio blowing up usually means
+    # either a real spectral anomaly or a denominator sitting near zero
+         
     print(df["ratio_R02_R09"].sort_values(ascending=False).head(10))
     df = df.dropna(subset=features + [TARGET])
+
+    # sanity check on a handful of the rows that showed up in the sort above
     print(df.loc[[121617, 121616, 121672, 121632, 121606], ["LOCATION_NAME", "SAMPLE_TIME", "R02", "R09", "DOSE_RATE"]])
     if sample_size is not None:
         df = df.sample(n=min(sample_size, len(df)), random_state=random_state)
@@ -170,7 +182,7 @@ if __name__ == "__main__":
 
     df = df[(df["DOSE_RATE"] > 0) & (df[BASE_FEATURES] > 0).all(axis=1)]
 
-    print(f"Loaded {len(df)} hourly readings from Philadelphia RadNet station")
+    print(f"Loaded {len(df)} hourly readings from Pittsburgh RadNet station")
     print(df[[TARGET] + FEATURES].describe().round(1))
     print()
 
