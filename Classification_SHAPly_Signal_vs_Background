@@ -15,10 +15,15 @@ from sklearn.metrics import roc_auc_score, roc_curve, average_precision_score
 import xgboost as xgb
 import shap
 
+# fix the seed everywhere so re-running this notebook gives the same split,
+# same resampling, same SHAP sample, etc.
+
 RNG_SEED = 42
 np.random.seed(RNG_SEED)
 
-
+# point this at wherever you unzipped the real Dataverse download. if it's
+# not there we fall back to synthetic data below so the notebook still runs
+# end to end without the real files.
 
 DR2_DATA_DIR = "icetracks_dr2/events"   # <- point this at your unzipped Dataverse download
 DR2_DOI_URL = "https://doi.org/10.7910/DVN/MMIIZA"
@@ -58,20 +63,24 @@ def make_synthetic_icecube(n_events: int = 200_000, seed: int = RNG_SEED) -> pd.
         a, b = e_min ** (1 - gamma), e_max ** (1 - gamma)
         return (a + u * (b - a)) ** (1 / (1 - gamma))
 
-    # true (hidden) latent population -- only used to build a realistic energy
-    # spectrum; the classifier never sees this, it only sees the reweighted
-    # pseudo-labels built downstream from log10(E/GeV) and declination
+    # this latent astro/atmospheric split is only used to build a believable
+    # energy spectrum below. the classifier never touches it directly, it
+    # only ever sees the pseudo-labels built later from log10(E) and Dec
     frac_astro = 0.02
     is_astro_latent = rng.random(n_events) < frac_astro
     e_conv = powerlaw_sample(n_events, gamma=3.0, e_min=100)      # steep, soft
     e_astro = powerlaw_sample(n_events, gamma=2.2, e_min=800)     # hard, rare
     e_gev = np.where(is_astro_latent, e_astro, e_conv)
 
-    # atmospheric component is suppressed in the Southern sky (higher energy
-    # threshold from the down-going muon veto); astrophysical is isotropic
+    # the atmospheric component gets knocked down in the Southern sky because
+    # the down-going muon veto raises the effective energy threshold there;
+    # the astrophysical component doesn't care about direction
     dec_suppression = np.where(is_astro_latent, 1.0, np.clip(1.3 - dec / 250, 0.35, None))
     e_gev = e_gev * dec_suppression
     log10E = np.log10(np.clip(e_gev, 100, 1e8))
+
+    # angular error shrinks a bit at higher energy, which is roughly what
+    # you'd expect from real track reconstruction
 
     ang_err = np.clip(rng.gamma(2.0, 0.35 / (1 + 0.15 * (log10E - 3))), 0.05, 5.0)
     mjd = rng.uniform(54000, 59900, n_events)
@@ -85,7 +94,8 @@ def make_synthetic_icecube(n_events: int = 200_000, seed: int = RNG_SEED) -> pd.
         "Azimuth[deg]": azimuth,
         "Zenith[deg]": zenith,
     })
-
+# try the real data first, and only build synthetic events if that fails
+# for any reason (missing folder, empty folder, etc.)
 
 try:
     events = load_local_dr2(DR2_DATA_DIR)
@@ -113,10 +123,18 @@ def spectral_weights(log10E: np.ndarray, gamma: float, proposal_gamma: float = 3
     delta = gamma - proposal_gamma
     return 10 ** (-delta * log10E)
 
+# two working assumptions for the two classes we're building:
+# atmospheric background falls off like E^-3.7, the astrophysical-like
+# population is harder, closer to E^-2.3
+
 
 gamma_conv, gamma_astro = 3.7, 2.3
 w_bkg = spectral_weights(events["log10(E/GeV)"].values, gamma_conv)
 w_sig = spectral_weights(events["log10(E/GeV)"].values, gamma_astro)
+
+# resample (with replacement) from the same pool of events using those two
+# weight vectors, so we end up with two differently-shaped populations built
+# from the same underlying detector data
 
 n_per_class = min(80_000, len(events) // 3)
 rng = np.random.default_rng(RNG_SEED)
@@ -131,10 +149,10 @@ dataset = pd.concat([df_bkg, df_sig], ignore_index=True).sample(frac=1.0, random
 print(dataset["label"].value_counts())
 dataset.head()
 
-
-
-
-
+# base features straight from the event table, plus two derived ones that
+# tend to help tree models: sin(dec) handles the wraparound at the poles
+# better than raw degrees, and log_ang_err flattens out a right-skewed
+# distribution
 
 feature_cols = ["log10(E/GeV)", "AngErr[deg]", "Dec[deg]", "Zenith[deg]"]
 
@@ -146,12 +164,19 @@ feature_cols += ["sin_dec", "log_ang_err"]
 X = dataset[feature_cols].values
 y = dataset["label"].values
 
+# 75/25 train+val / test split, then carve 20% off the training portion for
+# a validation set used for early stopping. stratify=y keeps the class
+# balance the same across all three splits
+
 X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=0.25, stratify=y, random_state=RNG_SEED
 )
 X_train, X_val, y_train, y_val = train_test_split(
     X_train, y_train, test_size=0.2, stratify=y_train, random_state=RNG_SEED
 )
+
+# fit the scaler on training data only, then apply it everywhere, so no
+# information from val/test leaks into how the features get normalized
 
 scaler = StandardScaler().fit(X_train)
 X_train_s, X_val_s, X_test_s = (scaler.transform(a) for a in (X_train, X_val, X_test))
@@ -210,20 +235,28 @@ plt.show()
 
 
 
-# recompute spectral weights for exactly the held-out test rows
+# rebuild the same train/test split by index so we can line up the
+# per-event physical weights with the exact rows that ended up in y_test
+
 test_mask = np.zeros(len(dataset), dtype=bool)
 _, test_pos = train_test_split(np.arange(len(dataset)), test_size=0.25, stratify=y, random_state=RNG_SEED)
 test_mask[test_pos] = True
 w_test_bkg_raw = spectral_weights(dataset["log10(E/GeV)"].values[test_mask], gamma_conv)
 w_test_sig_raw = spectral_weights(dataset["log10(E/GeV)"].values[test_mask], gamma_astro)
 
-# normalize each to its own sum, then scale to an assumed physical population
-# size so S and B are on a directly comparable, physically meaningful footing
+# normalize each class's weights to sum to 1, then scale up to an assumed
+# real-world event count, so S and B end up in comparable, physical units
+# instead of arbitrary resampling weights
+
 N_BKG_ASSUMED = 200_000   # illustrative -- replace with your real exposure-based estimate
 N_SIG_ASSUMED = 100       # illustrative -- background-dominated, as in real IceCube PS data
 w_test_bkg = (w_test_bkg_raw / w_test_bkg_raw.sum()) * N_BKG_ASSUMED
 w_test_sig = (w_test_sig_raw / w_test_sig_raw.sum()) * N_SIG_ASSUMED
 w_physical = np.where(y_test == 1, w_test_sig, w_test_bkg)
+
+# sweep the classifier's score threshold and track S/sqrt(S+B) at each cut,
+# which is the standard significance metric for a background-dominated
+# counting experiment like this one
 
 thresholds = np.linspace(0, 1, 200)
 significance = []
